@@ -2502,6 +2502,22 @@ Rules:
       await sleep(1500);
     }
 
+    // ── Safeguard: Ensure any "Ready to submit?" confirmation modal is dismissed ──
+    for (let mAttempt = 0; mAttempt < 5; mAttempt++) {
+      await sleep(600);
+      const mRes = await new Promise(resolve => {
+        chrome.tabs.sendMessage(tabId, { action: 'CONFIRM_MODAL_SUBMIT' }, r =>
+          resolve(chrome.runtime.lastError ? null : r)
+        );
+      });
+      if (mRes?.success) {
+        console.log(`[BatchSolver] Confirmation modal confirmed on pass ${mAttempt + 1}`);
+        submitted = true;
+        await sleep(1500);
+        break;
+      }
+    }
+
     if (submitted) {
       showToast(`🎉 Submitted (${index + 1}/${total}): "${quiz.title}"! ✅`, 3500);
       // Wait 3.5s so Coursera registers submission and transitions page

@@ -1407,9 +1407,9 @@
         return false;
       };
 
-      // 1. If explicit scope provided (e.g. modal dialog), search inside it first
+      // 1. If explicit scope provided (e.g. modal dialog), search inside it only
       if (scope) {
-        if (checkInContainer(scope)) return true;
+        return checkInContainer(scope);
       }
 
       // 2. Check any open confirmation modal dialogs
@@ -1461,6 +1461,112 @@
       };
     },
 
+    findAndClickConfirmationModal() {
+      // 1. Find all modal / dialog / overlay containers
+      const modalContainers = [
+        ...document.querySelectorAll('div[role="dialog"], [role="dialog"], [role="alertdialog"], div[aria-modal="true"], [aria-modal="true"], dialog, .rc-Modal, [data-testid*="modal" i], div[class*="modal" i], div[class*="dialog" i], div[class*="Overlay" i]')
+      ];
+
+      // 2. Also detect by "Ready to submit" heading or prompt text
+      const readyElements = Array.from(document.querySelectorAll('h1, h2, h3, h4, div, span, p')).filter(el => {
+        const txt = (el.textContent || '').trim().toLowerCase();
+        return txt.includes('ready to submit') || txt.includes('are you sure you want to submit') || txt === 'ready to submit?';
+      });
+
+      for (const el of readyElements) {
+        const box = el.closest('div[role], div[class*="modal" i], div[class*="dialog" i], [aria-modal="true"], div:has(button)') || el.parentElement?.parentElement || el.parentElement;
+        if (box && !modalContainers.includes(box)) {
+          modalContainers.unshift(box);
+        }
+      }
+
+      // 3. Search confirm button within found modal containers
+      for (const container of modalContainers) {
+        // Ensure honor code inside this modal is ticked if present
+        try { this.findAndTickHonorCode(container); } catch(e) {}
+
+        const buttons = Array.from(container.querySelectorAll('button, [role="button"]'));
+        const confirmBtn = buttons.find(b => {
+          const t = (b.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+          const testId = (b.getAttribute('data-testid') || '').toLowerCase();
+
+          // Strictly filter out cancel/close/back/dismiss
+          if (t.includes('cancel') || t.includes('back') || t.includes('close') || t.includes('dismiss') || t === 'no' ||
+              aria.includes('close') || aria.includes('cancel') || testId.includes('cancel') || testId.includes('close')) {
+            return false;
+          }
+
+          // Must match submit/confirm keywords or primary styling
+          return t === 'submit' || t.includes('submit') || t.includes('confirm') || t.includes('yes') || t.includes('continue') ||
+                 t.includes('grade') || aria.includes('submit') || aria.includes('confirm') ||
+                 testId.includes('submit') || testId.includes('confirm') ||
+                 b.classList.contains('cds-button-primary') || b.classList.contains('primary');
+        });
+
+        if (confirmBtn) {
+          return this._executeButtonClick(confirmBtn, 'Modal Confirm');
+        }
+      }
+
+      // 4. Global fallback: Any primary or submit button within an overlay or near "Ready to submit"
+      const allButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const btn of allButtons) {
+        const t = (btn.textContent || '').trim().toLowerCase();
+        if (t === 'submit' || t === 'yes, submit') {
+          const isModal = btn.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog, [class*="modal" i], [class*="dialog" i], [class*="Overlay" i]') ||
+                          btn.parentElement?.innerText?.toLowerCase()?.includes('ready to submit') ||
+                          btn.parentElement?.parentElement?.innerText?.toLowerCase()?.includes('ready to submit');
+          if (isModal) {
+            return this._executeButtonClick(btn, 'Fallback Modal Submit');
+          }
+        }
+      }
+
+      return false;
+    },
+
+    _executeButtonClick(btn, label = 'Button') {
+      if (!btn) return false;
+      console.log(`[CourseraSolver] Clicking ${label}:`, btn.textContent.trim());
+
+      if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+        btn.disabled = false;
+        btn.removeAttribute('disabled');
+        btn.removeAttribute('aria-disabled');
+      }
+
+      try { btn.focus(); } catch(e) {}
+
+      const evtOpts = { bubbles: true, cancelable: true, composed: true, view: window };
+
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
+        try { btn.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
+      });
+      try { btn.click(); } catch(e) {}
+
+      // Invoke React's internal onClick handler directly
+      const rKey = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+      if (rKey && btn[rKey] && typeof btn[rKey].onClick === 'function') {
+        try {
+          btn[rKey].onClick({
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            nativeEvent: new MouseEvent('click', evtOpts),
+            target: btn,
+            currentTarget: btn
+          });
+        } catch(e) {}
+      }
+
+      const inner = btn.querySelector('.cds-button-label, [class*="label"], span');
+      if (inner) {
+        try { inner.click(); } catch(e) {}
+      }
+
+      return true;
+    },
+
     async submit() {
       console.log('[CourseraSolver] Initiating quiz submission sequence...');
 
@@ -1485,6 +1591,11 @@
       }
 
       if (!btn) {
+        // Check if confirmation modal is already open
+        if (this.findAndClickConfirmationModal()) {
+          console.log('[CourseraSolver] Confirmation modal was already open, clicked submit!');
+          return { success: true };
+        }
         throw new Error('Could not locate Coursera submission button on this page.');
       }
 
@@ -1506,107 +1617,28 @@
       }
 
       console.log('[CourseraSolver] Submitting quiz via Coursera button click...');
-      const evtOpts = { bubbles: true, cancelable: true, composed: true, view: window };
-      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
-        try { btn.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
-      });
-      try { btn.click(); } catch(e) {}
+      this._executeButtonClick(btn, 'Main Page Submit Button');
 
-      // Invoke React's internal onClick directly
-      const rKey = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
-      if (rKey && btn[rKey] && typeof btn[rKey].onClick === 'function') {
-        console.log('[CourseraSolver] Direct React onClick invocation on submit button...');
-        try {
-          btn[rKey].onClick({
-            preventDefault: () => {},
-            stopPropagation: () => {},
-            nativeEvent: new MouseEvent('click', evtOpts),
-            target: btn,
-            currentTarget: btn
-          });
-        } catch(err) {
-          console.warn('[CourseraSolver] React onClick invocation error:', err);
-        }
-      }
+      // 6. Handle Confirmation Modal Dialog ("Ready to submit?")
+      let modalHandled = false;
+      for (let attempt = 0; attempt < 16; attempt++) {
+        await new Promise(r => setTimeout(r, 400));
+        modalHandled = this.findAndClickConfirmationModal();
+        if (modalHandled) {
+          console.log('[CourseraSolver] Confirmation modal handled successfully on attempt', attempt + 1);
+          await new Promise(r => setTimeout(r, 1200));
 
-      // Also trigger parent form requestSubmit if present
-      const parentForm = btn.closest('form');
-      if (parentForm) {
-        try {
-          if (typeof parentForm.requestSubmit === 'function') {
-            parentForm.requestSubmit(btn);
-          } else {
-            parentForm.dispatchEvent(new Event('submit', evtOpts));
+          // Check if modal is still open
+          const stillOpen = Array.from(document.querySelectorAll('h1, h2, h3, h4, div, span, p')).some(el =>
+            (el.textContent || '').trim().toLowerCase().includes('ready to submit')
+          );
+          if (stillOpen) {
+            console.log('[CourseraSolver] Confirmation modal still visible, retrying click...');
+            this.findAndClickConfirmationModal();
+            await new Promise(r => setTimeout(r, 800));
           }
-        } catch(e) {}
-      }
-
-      // 6. Handle Confirmation Modal Dialog (Wait and click confirm/submit, excluding cancel/close)
-      for (let attempt = 0; attempt < 10; attempt++) {
-        await new Promise(r => setTimeout(r, 500));
-        const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[aria-modal="true"], .rc-Modal, [data-testid*="modal"]'));
-        if (!dialogs.length) continue;
-
-        let modalHandled = false;
-        for (const dialog of dialogs) {
-          // Ensure Honor Code inside confirmation modal is ticked first!
-          try {
-            this.findAndTickHonorCode(dialog);
-            await new Promise(r => setTimeout(r, 200));
-          } catch(e) {}
-
-          const buttons = Array.from(dialog.querySelectorAll('button, [role="button"]'));
-
-          // Find confirm button, strictly filtering out cancel/close buttons
-          const confirmBtn = buttons.find(b => {
-            const t = (b.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
-            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-            const testId = (b.getAttribute('data-testid') || '').toLowerCase();
-
-            // Must NOT be cancel/back/close/dismiss
-            if (t.includes('cancel') || t.includes('back') || t.includes('close') || t.includes('dismiss') || t.includes('no') ||
-                aria.includes('close') || aria.includes('cancel') || testId.includes('cancel') || testId.includes('close')) {
-              return false;
-            }
-
-            // Must match submit/confirm keywords or primary styling
-            return t.includes('submit') || t.includes('confirm') || t.includes('yes') || t.includes('continue') ||
-                   t.includes('grade') || t.includes('agree') || aria.includes('submit') || aria.includes('confirm') ||
-                   testId.includes('submit') || testId.includes('confirm') ||
-                   b.classList.contains('cds-button-primary') || b.classList.contains('primary');
-          });
-
-          if (confirmBtn) {
-            if (confirmBtn.disabled || confirmBtn.getAttribute('aria-disabled') === 'true') {
-              try { this.findAndTickHonorCode(dialog); } catch(e) {}
-              confirmBtn.disabled = false;
-              confirmBtn.removeAttribute('disabled');
-              confirmBtn.removeAttribute('aria-disabled');
-            }
-
-            console.log('[CourseraSolver] Confirmation modal detected! Clicking confirm button:', confirmBtn.textContent.trim());
-            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
-              try { confirmBtn.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
-            });
-            try { confirmBtn.click(); } catch(e) {}
-
-            const cKey = Object.keys(confirmBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
-            if (cKey && confirmBtn[cKey] && typeof confirmBtn[cKey].onClick === 'function') {
-              try {
-                confirmBtn[cKey].onClick({
-                  preventDefault: () => {},
-                  stopPropagation: () => {},
-                  nativeEvent: new MouseEvent('click', evtOpts),
-                  target: confirmBtn,
-                  currentTarget: confirmBtn
-                });
-              } catch(e) {}
-            }
-            modalHandled = true;
-            break;
-          }
+          break;
         }
-        if (modalHandled) break;
       }
 
       // Quiz has been submitted! Immediately mark and lock submission state:
@@ -5622,6 +5654,13 @@
       SubmissionController.submit()
         .then(res => sendResponse(res || { success: true }))
         .catch(err => sendResponse({ success: false, reason: err.message }));
+      return true;
+    }
+
+    // 6b. Confirm Modal Submit (e.g. "Ready to submit?" confirmation dialog)
+    if (action === 'CONFIRM_MODAL_SUBMIT') {
+      const clicked = SubmissionController.findAndClickConfirmationModal();
+      sendResponse({ success: clicked });
       return true;
     }
 
