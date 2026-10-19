@@ -85,7 +85,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (unlockBtn) {
     unlockBtn.addEventListener('click', () => {
       const key = keyDisplay ? keyDisplay.innerText.trim() : 'MOHAN THE HERO';
-      
+
       const payload = {
         licenseKey: key,
         licenseTier: 'PRO',
@@ -98,7 +98,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       try {
         localStorage.setItem('quiz_solver_license', key);
-      } catch(e) {}
+      } catch (e) { }
 
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
         chrome.storage.local.set(payload, () => {
@@ -125,7 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
     docLink.addEventListener('click', (e) => {
       e.preventDefault();
       showToast('Opening documentation...', 'info');
-      window.open('https://github.com/rishiraj58463/RR-Quiz-Solver', '_blank');
+      window.open('https://github.com/Mohan0621/Quiz-solver', '_blank');
     });
   }
   if (portalLink) {

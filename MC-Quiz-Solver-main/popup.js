@@ -512,7 +512,7 @@
   // =========================================================================
   function setupShareableLink() {
     const copyRepoBtn = document.getElementById('shareLink') || document.getElementById('shareableLinkBtn');
-    const repoUrl = 'https://github.com/rishiraj58463/RR-Quiz-Solver';
+    const repoUrl = 'https://github.com/Mohan0621/Quiz-solver';
 
     if (copyRepoBtn) {
       copyRepoBtn.addEventListener('click', (e) => {
@@ -2021,7 +2021,622 @@ Rules:
   }
 
   // =========================================================================
-  // 17. MASTER INITIALIZATION
+  // 17. 🔥 BATCH SOLVE GRADED QUIZZES (#batchSolveBtn)
+  // Uses the exact same solve flow as "Solve This Quiz" for each quiz.
+  // =========================================================================
+  let isBatchSolving = false;
+  let batchAbortRequested = false;
+
+  // ── Fetch graded quiz list via background.js & content.js ────────
+  async function fetchGradedQuizQueue(courseSlug) {
+    // Types that should NEVER be queued for quiz solving (they cannot be solved by question extractor)
+    const NON_QUIZ_TYPES = new Set([
+      'lecture', 'video', 'supplement', 'reading',
+      'ungradedquiz', 'ungradedplugin', 'ungradedwidget', 'ungradedlab',
+      'discussionprompt', 'discussionpromptv2', 'discussion',
+      'peer', 'phasedpeer', 'staffgradedassignment', 'teammember',
+      'programming', 'workspace', 'notebook', 'lab',
+      'widget', 'plugin', 'lti'
+    ]);
+
+    // ── Step 1: fetch raw materials from background worker ──────────────
+    let materials = null;
+    let errorDebug = '';
+
+    const res = await new Promise(resolve => {
+      chrome.runtime.sendMessage(
+        { action: 'FETCH_COURSE_MATERIALS', courseSlug },
+        r => resolve(chrome.runtime.lastError ? { _runtimeError: chrome.runtime.lastError.message } : (r || {}))
+      );
+    });
+
+    if (res?.materials) {
+      materials = res.materials;
+    } else {
+      errorDebug = res?._runtimeError || res?.error || 'Background fetch failed';
+      // Fallback: try querying active tab's content script directly
+      try {
+        const tab = await getActiveCourseraTab();
+        if (tab?.id) {
+          const tabRes = await new Promise(resolve => {
+            chrome.tabs.sendMessage(tab.id, { action: 'FETCH_COURSE_MATERIALS', courseSlug }, r =>
+              resolve(chrome.runtime.lastError ? null : r)
+            );
+          });
+          if (tabRes?.materials) {
+            materials = tabRes.materials;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (!materials) {
+      return { quizzes: null, debug: `API failed: ${errorDebug}` };
+    }
+
+    const linked      = materials.linked   || {};
+    const elements    = materials.elements  || [];
+    const modulesArr  = linked['onDemandCourseMaterialModules.v1'] || [];
+    const lessonsArr  = linked['onDemandCourseMaterialLessons.v1'] || [];
+    const itemsArr    = linked['onDemandCourseMaterialItems.v2']   || [];
+    const passableArr = linked['onDemandCourseMaterialPassableLessonElements.v1'] || [];
+
+    if (itemsArr.length === 0 && modulesArr.length === 0) {
+      return { quizzes: null, debug: `API returned 0 course items and 0 modules.` };
+    }
+
+    const modulesMap  = new Map(modulesArr.map(m => [m.id, m]));
+    const lessonsMap  = new Map(lessonsArr.map(l => [l.id, l]));
+    const itemsMap    = new Map(itemsArr.map(i => [i.id, i]));
+    const passableMap = new Map(passableArr.map(p => [p.id, p]));
+
+    const passableItemGroupsArr = linked['onDemandCourseMaterialPassableItemGroups.v1'] || [];
+    const gradingParamsArr      = linked['onDemandGradingParameters.v1'] || [];
+
+    // Collect all elements explicitly registered as passable/graded in Coursera's curriculum
+    const gradedElementIds = new Set();
+    if (Array.isArray(passableArr)) {
+      for (const p of passableArr) {
+        if (p?.id) {
+          gradedElementIds.add(p.id);
+          const parts = p.id.split('~');
+          if (parts.length > 1) gradedElementIds.add(parts[parts.length - 1]);
+        }
+      }
+    }
+
+    if (Array.isArray(passableItemGroupsArr)) {
+      for (const pig of passableItemGroupsArr) {
+        if (!pig) continue;
+        const gItemIds = Array.isArray(pig.itemIds) ? pig.itemIds : (Array.isArray(pig.elementIds) ? pig.elementIds : []);
+        for (const id of gItemIds) {
+          if (id) gradedElementIds.add(id);
+        }
+      }
+    }
+
+    if (Array.isArray(gradingParamsArr)) {
+      for (const gp of gradingParamsArr) {
+        if (!gp || !gp.gradedAssignmentGroups) continue;
+        const rawGroups = gp.gradedAssignmentGroups;
+        const groups = Array.isArray(rawGroups) ? rawGroups : (typeof rawGroups === 'object' ? Object.values(rawGroups) : []);
+        for (const grp of groups) {
+          if (!grp) continue;
+          const aIds = Array.isArray(grp.assignmentIds) ? grp.assignmentIds :
+                       (Array.isArray(grp.itemIds) ? grp.itemIds :
+                       (Array.isArray(grp.elementIds) ? grp.elementIds : []));
+          for (const id of aIds) {
+            if (id) gradedElementIds.add(id);
+          }
+        }
+      }
+    }
+
+    // Helper: Is this item strictly a GRADED quiz/exam that our solver can solve?
+    function isGradedQuiz(item) {
+      if (!item) return false;
+      const rawType = (item.contentSummary?.typeName || '').toLowerCase().trim();
+      const name    = (item.name || item.originalName || '').toLowerCase().trim();
+      const slug    = (item.slug || '').toLowerCase().trim();
+
+      // 1. Explicit non-quiz types (videos, readings, discussions, peer reviews, programming labs)
+      if (NON_QUIZ_TYPES.has(rawType)) return false;
+      if (rawType.includes('peer') || rawType.includes('programming') || rawType.includes('workspace') ||
+          rawType.includes('lab') || rawType === 'lti' || rawType.includes('plugin') || rawType.includes('widget') ||
+          rawType.includes('lecture') || rawType.includes('supplement') || rawType.includes('discussion')) {
+        return false;
+      }
+
+      // 2. Strict rejection of ANY practice, ungraded, or formative quiz / assessment
+      const isPracticeOrUngraded =
+        name.includes('practice') ||
+        slug.includes('practice') ||
+        rawType.includes('practice') ||
+        name.includes('ungraded') ||
+        slug.includes('ungraded') ||
+        rawType.includes('ungraded') ||
+        name.includes('formative') ||
+        slug.includes('formative') ||
+        name.includes('knowledge check') ||
+        name.includes('self-assessment') ||
+        name.includes('self assessment') ||
+        name.includes('drill') ||
+        name.includes('diagnostic') ||
+        name.includes('peer review') ||
+        name.includes('peer-graded') ||
+        name.includes('programming assignment');
+
+      if (isPracticeOrUngraded) return false;
+
+      // 3. Optional items are never required graded quizzes
+      if (item.optional === true) return false;
+
+      // 4. Passable element verification (Coursera's source of truth for graded items)
+      const passable = passableMap.get(item.id) ||
+        passableArr.find(p => p.id === item.id || (p.id && (p.id.endsWith('~' + item.id) || p.id.startsWith(item.id + '~'))));
+      const isPassableGraded = (passable && (passable.gradingWeight > 0 || passable.isRequiredForPassing === true)) ||
+        gradedElementIds.has(item.id);
+
+      // 5. Explicit graded types and title keywords
+      const isExplicitGradedType =
+        rawType === 'gradedquiz' ||
+        rawType === 'gradedexam' ||
+        rawType === 'timedexam' ||
+        rawType === 'gradedassignment' ||
+        rawType.startsWith('graded');
+
+      const isGradedByNameOrSlug =
+        name.includes('graded') ||
+        slug.includes('graded');
+
+      const hasQuizOrExamKeyword =
+        rawType.includes('quiz') ||
+        rawType.includes('exam') ||
+        rawType.includes('test') ||
+        rawType.includes('assessment') ||
+        name.includes('quiz') ||
+        name.includes('exam') ||
+        name.includes('test') ||
+        name.includes('assessment') ||
+        slug.includes('quiz') ||
+        slug.includes('exam') ||
+        slug.includes('test') ||
+        slug.includes('assessment');
+
+      // 6. Strict validation: Only accept if confirmed graded
+      if (gradedElementIds.size > 0 || passableArr.length > 0) {
+        if (isPassableGraded && hasQuizOrExamKeyword) return true;
+        if (isExplicitGradedType) return true;
+        if (isGradedByNameOrSlug && hasQuizOrExamKeyword) return true;
+        // If course provides passable metadata, any other quiz is practice/ungraded!
+        return false;
+      }
+
+      // Fallback if course API provides no passable metadata:
+      if (isExplicitGradedType) return true;
+      if (isGradedByNameOrSlug && hasQuizOrExamKeyword) return true;
+
+      // Never assume generic quizzes are graded without proof
+      return false;
+    }
+
+    // ── Collect all module IDs in exact course order across all elements ─────
+    let moduleIds = [];
+    for (const el of elements) {
+      if (Array.isArray(el.moduleIds)) {
+        for (const mid of el.moduleIds) {
+          if (!moduleIds.includes(mid)) moduleIds.push(mid);
+        }
+      }
+    }
+    // Also append any modules in modulesArr that weren't in elements.moduleIds
+    for (const mod of modulesArr) {
+      if (mod?.id && !moduleIds.includes(mod.id)) {
+        moduleIds.push(mod.id);
+      }
+    }
+
+    const quizzes = [];
+    const seen = new Set();
+
+    // ── Step 2: Iterate through every module in sequential order ──────────
+    moduleIds.forEach((modId, modIndex) => {
+      const mod = modulesMap.get(modId);
+      const moduleTitle = mod?.name || `Module ${modIndex + 1}`;
+
+      const lessonIds = mod?.lessonIds || [];
+      for (const lessonId of lessonIds) {
+        const lesson = lessonsMap.get(lessonId);
+        if (!lesson) continue;
+
+        const itemIds = lesson.elementIds || lesson.itemIds || [];
+        for (const itemId of itemIds) {
+          if (seen.has(itemId)) continue;
+          const item = itemsMap.get(itemId);
+          if (!item) continue;
+          if (!isGradedQuiz(item)) continue;
+          if (item.isLocked || item.lockedStatus === 'locked') continue;
+
+          seen.add(itemId);
+          quizzes.push({
+            itemId,
+            title: item.name || item.originalName || 'Graded Quiz',
+            moduleTitle,
+            moduleIndex: modIndex + 1,
+            typeName: item.contentSummary?.typeName || '',
+            url: `https://www.coursera.org/learn/${courseSlug}/item/${itemId}`,
+          });
+        }
+      }
+    });
+
+    // ── Step 3: Check remaining items in itemsArr (fallback for any unlinked) ──
+    for (const item of itemsArr) {
+      if (!item?.id || seen.has(item.id)) continue;
+      if (!isGradedQuiz(item)) continue;
+      if (item.isLocked || item.lockedStatus === 'locked') continue;
+
+      seen.add(item.id);
+      quizzes.push({
+        itemId: item.id,
+        title: item.name || item.originalName || 'Graded Quiz',
+        moduleTitle: 'Course Graded Quiz',
+        moduleIndex: moduleIds.length + 1,
+        typeName: item.contentSummary?.typeName || '',
+        url: `https://www.coursera.org/learn/${courseSlug}/item/${item.id}`,
+      });
+    }
+
+    return {
+      quizzes: quizzes.length > 0 ? quizzes : null,
+      debug: `${itemsArr.length} items scanned across ${moduleIds.length} modules, found ${quizzes.length} graded quizzes.`
+    };
+  }
+
+  // ── Navigate a tab to a URL and wait for it to finish loading ────────────
+  function navigateTabAndWait(tabId, url) {
+    return new Promise((resolve) => {
+      chrome.tabs.update(tabId, { url }, () => {
+        function onUpdated(id, info) {
+          if (id === tabId && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          }
+        }
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        // Safety timeout — resolve after 30s even if event never fires
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        }, 30000);
+      });
+    });
+  }
+
+  // ── Solve one quiz using the exact same flow as "Solve This Quiz" ────────
+  async function solveOneQuiz(tabId, quiz, index, total, setBatchBtnState) {
+    if (batchAbortRequested) return 'stop';
+
+    const shortTitle = quiz.title.length > 24 ? quiz.title.substring(0, 22) + '…' : quiz.title;
+    setBatchBtnState('running', `${index + 1}/${total}: ${quiz.moduleTitle} — ${shortTitle}`);
+
+    // Navigate to quiz item and wait for initial load
+    showToast(`🚀 [${index + 1}/${total}] ${quiz.moduleTitle}: "${quiz.title}"`, 3500);
+    await navigateTabAndWait(tabId, quiz.url);
+
+    // Give React time to mount client-side routes
+    await sleep(2500);
+
+    // Ensure content script is ready
+    const ready = await ensureContentScriptReady(tabId);
+    if (!ready) {
+      showToast(`⚠️ Content script not ready for "${quiz.title}" — skipping`);
+      return false;
+    }
+
+    // ── Extract questions or detect Start/Resume button ───────────────────
+    let extractRes = null;
+    let questionsFound = false;
+
+    // Poll up to 10 attempts (every 700ms) for questions OR a start/resume button to appear
+    for (let waitAttempt = 0; waitAttempt < 10; waitAttempt++) {
+      if (batchAbortRequested) return 'stop';
+
+      extractRes = await new Promise(resolve => {
+        chrome.tabs.sendMessage(tabId, { action: 'EXTRACT_QUIZ' }, r =>
+          resolve(chrome.runtime.lastError ? { success: false } : (r || { success: false }))
+        );
+      });
+
+      if (extractRes?.isPracticeQuiz) {
+        showToast(`⏭️ "${quiz.title}" is a practice quiz — skipping (graded only)`, 3500);
+        console.log(`[BatchSolver] Skipping "${quiz.title}" because it was detected as a practice quiz on the page.`);
+        return true;
+      }
+
+      if (extractRes?.success && extractRes.questions?.length > 0) {
+        questionsFound = true;
+        break;
+      }
+      if (extractRes?.hasStartButton) {
+        break;
+      }
+      await sleep(700);
+    }
+
+    // If there is a Start, Resume, or Retake button, launch attempt and poll for questions
+    if (!questionsFound && extractRes?.hasStartButton) {
+      showToast(`▶️ Launching attempt for "${quiz.title}"…`, 2500);
+      setBatchBtnState('running', `Starting attempt ${index + 1}/${total}…`);
+      await new Promise(r => chrome.tabs.sendMessage(tabId, { action: 'START_QUIZ' }, r));
+      await sleep(1500);
+
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (batchAbortRequested) return 'stop';
+        await sleep(600);
+        extractRes = await new Promise(r => {
+          chrome.tabs.sendMessage(tabId, { action: 'EXTRACT_QUIZ' }, res =>
+            r(chrome.runtime.lastError ? { success: false } : (res || { success: false }))
+          );
+        });
+        if (extractRes?.isPracticeQuiz) {
+          showToast(`⏭️ "${quiz.title}" is a practice quiz — skipping (graded only)`, 3500);
+          return true;
+        }
+        if (extractRes?.success && extractRes.questions?.length > 0) {
+          questionsFound = true;
+          break;
+        }
+      }
+    }
+
+    // If still no questions, check if quiz was already passed / submitted
+    if (!questionsFound) {
+      if (extractRes?.isReviewMode) {
+        showToast(`✅ "${quiz.title}" is already completed / submitted!`, 3000);
+        return true;
+      }
+      showToast(`⚠️ No questions found for "${quiz.title}" — skipping`, 3000);
+      return false;
+    }
+
+    const questions = (extractRes.questions || []).filter(q => q.prompt && q.prompt.length > 2);
+    if (!questions.length) {
+      showToast(`⚠️ No valid questions in "${quiz.title}" — skipping`, 2500);
+      return false;
+    }
+
+    // ── Query AI (same as Step 6 in Solve This Quiz) ──────────────────────
+    const stored = await new Promise(resolve =>
+      chrome.storage.local.get(['apiKey', 'groqApiKey', 'geminiApiKey', 'llmProvider', 'provider', 'groqModel', 'geminiModel', 'autoSubmitQuiz'], resolve)
+    );
+
+    let provider = stored.llmProvider || stored.provider || 'groq';
+    let apiKey   = provider === 'gemini'
+      ? (stored.geminiApiKey || (stored.apiKey?.startsWith('AIzaSy') ? stored.apiKey : ''))
+      : (stored.groqApiKey   || (stored.apiKey?.startsWith('gsk_')   ? stored.apiKey : stored.apiKey || ''));
+
+    if (apiKey?.startsWith('AIzaSy')) provider = 'gemini';
+    if (apiKey?.startsWith('gsk_'))   provider = 'groq';
+    if (!apiKey) apiKey = provider === 'gemini' ? stored.geminiApiKey : stored.groqApiKey;
+
+    const model = provider === 'gemini'
+      ? (stored.geminiModel || 'gemini-2.5-flash')
+      : (stored.groqModel   || 'llama-3.3-70b-versatile');
+
+    if (!apiKey) {
+      showToast('🔑 API key missing — stopping batch. Configure in Settings.', 4000);
+      return 'stop';
+    }
+
+    setBatchBtnState('running', `AI solving ${index + 1}/${total} (${questions.length} Qs)…`);
+    showToast(`🤖 AI solving ${questions.length} questions for "${quiz.title}"…`, 2500);
+
+    let aiResult;
+    try {
+      aiResult = await queryAI(provider, apiKey, model, questions);
+    } catch (err) {
+      showToast(`⚠️ AI error on "${quiz.title}": ${err.message?.slice(0, 45)} — skipping`, 3500);
+      return false;
+    }
+
+    if (!aiResult?.success || !Array.isArray(aiResult.answers) || !aiResult.answers.length) {
+      showToast(`⚠️ AI returned no answers for "${quiz.title}" — skipping`, 2500);
+      return false;
+    }
+
+    // ── Apply answers (same as Step 7 in Solve This Quiz) ─────────────────
+    setBatchBtnState('running', `Applying answers ${index + 1}/${total}…`);
+    await new Promise(resolve => {
+      chrome.tabs.sendMessage(tabId, { action: 'APPLY_ANSWERS', answers: aiResult.answers }, r =>
+        resolve(chrome.runtime.lastError ? null : r)
+      );
+    });
+
+    // ── Wait for Coursera React state to settle answers ──────────────────
+    await sleep(2000);
+
+    // ── Tick Honor Code checkbox (same as Step 8) ────────────────────────
+    let honorTicked = false;
+    for (let hAttempt = 0; hAttempt < 4; hAttempt++) {
+      if (batchAbortRequested) return 'stop';
+      const hRes = await new Promise(resolve => {
+        chrome.tabs.sendMessage(tabId, { action: 'TICK_HONOR_CODE' }, r =>
+          resolve(chrome.runtime.lastError ? null : r)
+        );
+      });
+      if (hRes?.success) {
+        honorTicked = true;
+        console.log(`[BatchSolver] Honor code successfully ticked on attempt ${hAttempt + 1}`);
+        break;
+      }
+      await sleep(600);
+    }
+    await sleep(800);
+
+    // ── Auto Submit Quiz (same as Step 9 in Solve This Quiz) ──────────────
+    setBatchBtnState('running', `Submitting ${index + 1}/${total}…`);
+    showToast(`📝 Submitting "${quiz.title}"…`, 2500);
+
+    let submitted = false;
+    let submitReason = '';
+    for (let subAttempt = 0; subAttempt < 3; subAttempt++) {
+      if (batchAbortRequested) return 'stop';
+      const subRes = await new Promise(resolve => {
+        chrome.tabs.sendMessage(tabId, { action: 'SUBMIT_QUIZ' }, r => {
+          if (chrome.runtime.lastError) {
+            resolve({ success: false, reason: chrome.runtime.lastError.message });
+          } else {
+            resolve(r || { success: false });
+          }
+        });
+      });
+
+      if (subRes?.success) {
+        submitted = true;
+        break;
+      } else {
+        submitReason = subRes?.reason || 'Submit button not enabled or not found';
+        console.warn(`[BatchSolver] Submit attempt ${subAttempt + 1} failed:`, submitReason);
+      }
+      await sleep(1500);
+    }
+
+    if (submitted) {
+      showToast(`🎉 Submitted (${index + 1}/${total}): "${quiz.title}"! ✅`, 3500);
+      // Wait 3.5s so Coursera registers submission and transitions page
+      await sleep(3500);
+      return true;
+    } else {
+      showToast(`⚠️ Answers applied, but submit failed: ${submitReason}`, 4000);
+      console.warn(`[BatchSolver] Failed to submit "${quiz.title}":`, submitReason);
+      await sleep(2000);
+      return true;
+    }
+  }
+
+  function setupBatchSolver() {
+    const batchBtn = document.getElementById('batchSolveBtn');
+    if (!batchBtn) return;
+
+    const ORIGINAL_HTML = batchBtn.innerHTML;
+
+    // Add spin keyframes once
+    if (!document.getElementById('mqb-popup-style')) {
+      const s = document.createElement('style');
+      s.id = 'mqb-popup-style';
+      s.textContent = '@keyframes mqbSpin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(s);
+    }
+
+    function setBatchBtnState(state, subtitle = '') {
+      if (state === 'running') {
+        batchBtn.disabled = true;
+        batchBtn.innerHTML = `
+          <div class="cta-left">
+            <div class="cta-icon-box" style="background:#b45309;color:#fff;">
+              <span class="material-symbols-outlined text-[22px]"
+                style="animation:mqbSpin 1.2s linear infinite;display:inline-block">
+                hourglass_empty
+              </span>
+            </div>
+            <div class="cta-text-group">
+              <span class="cta-title" style="color:#fef3c7;">Batch Solving…</span>
+              <span class="cta-subtitle" style="color:#fed7aa;">${subtitle || 'Working…'}</span>
+            </div>
+          </div>
+          <span class="material-symbols-outlined cta-arrow" style="color:#fed7aa;">stop_circle</span>`;
+      } else {
+        batchBtn.disabled = false;
+        batchBtn.innerHTML = ORIGINAL_HTML;
+      }
+    }
+
+    batchBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      // ── Stop if already running ──────────────────────────────────────
+      if (isBatchSolving) {
+        batchAbortRequested = true;
+        setBatchBtnState('idle');
+        showToast('⛔ Batch solve stopped.');
+        return;
+      }
+
+      // ── Get active Coursera tab ──────────────────────────────────────
+      let tab;
+      try { tab = await getActiveCourseraTab(); } catch {}
+      if (!tab || !tab.url?.includes('coursera.org')) {
+        showToast('❌ Open a Coursera course page first.');
+        return;
+      }
+
+      // ── Extract course slug from the tab URL ─────────────────────────
+      const slugMatch = tab.url.match(/\/learn\/([^/?#]+)/i);
+      if (!slugMatch) {
+        showToast('❌ Navigate inside a Coursera course first.');
+        return;
+      }
+      const courseSlug = slugMatch[1];
+
+      isBatchSolving = true;
+      batchAbortRequested = false;
+      setBatchBtnState('running', 'Scanning all course modules…');
+
+      try {
+        // ── Fetch graded quiz list across all modules ───────────────────
+        showToast('🔍 Scanning course modules for graded quizzes…', 3000);
+        const { quizzes, debug } = await fetchGradedQuizQueue(courseSlug);
+
+        if (!quizzes || quizzes.length === 0) {
+          showToast(`⚠️ No graded quizzes found. ${debug || ''}`, 6000);
+          setBatchBtnState('idle');
+          isBatchSolving = false;
+          return;
+        }
+
+        const moduleCount = new Set(quizzes.map(q => q.moduleTitle)).size;
+        showToast(`🎯 Found ${quizzes.length} graded quizzes across ${moduleCount} modules! Starting batch…`, 3500);
+
+        let solved = 0, failed = 0;
+
+        // ── Loop through every graded quiz across all modules ───────────
+        for (let i = 0; i < quizzes.length; i++) {
+          if (batchAbortRequested) break;
+
+          const quiz = quizzes[i];
+          const result = await solveOneQuiz(tab.id, quiz, i, quizzes.length, setBatchBtnState);
+
+          if (result === 'stop') break;
+          if (result === true) solved++;
+          else failed++;
+
+          if (batchAbortRequested) break;
+        }
+
+        // ── Done ────────────────────────────────────────────────────────
+        if (batchAbortRequested) {
+          showToast(`⛔ Batch solve stopped. ${solved}/${quizzes.length} completed.`);
+        } else {
+          const msg = failed > 0
+            ? `🏆 Batch done! ${solved}/${quizzes.length} solved & submitted, ${failed} skipped.`
+            : `🏆 All ${quizzes.length} graded quizzes across all modules solved & submitted! 🎉`;
+          showToast(msg, 6000);
+        }
+
+      } catch (err) {
+        showToast(`❌ Batch error: ${err.message?.slice(0, 50) || 'Unknown error'}`, 4000);
+      } finally {
+        isBatchSolving = false;
+        batchAbortRequested = false;
+        setBatchBtnState('idle');
+      }
+    });
+  }
+
+  // =========================================================================
+  // 18. MASTER INITIALIZATION
   // =========================================================================
   function initPopup() {
     try {
@@ -2038,6 +2653,7 @@ Rules:
       setupSolveThisQuiz();
       setupSolveSingleQuestion();
       setupSolveAllQuizzes();
+      setupBatchSolver();
       setupSubmissionWorkflow();
 
       const logoutBtn = document.getElementById('logoutBtn');

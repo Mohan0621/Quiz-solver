@@ -183,6 +183,56 @@
       }
 
       return false;
+    },
+
+    isPracticeQuiz() {
+      const url = (window.location.href || '').toLowerCase();
+      if (url.includes('/practice/') || url.includes('practice-quiz') || url.includes('practice_quiz')) {
+        return true;
+      }
+
+      const titleLower = (document.title || '').toLowerCase();
+      if (
+        titleLower.includes('practice quiz') ||
+        titleLower.includes('practice exam') ||
+        titleLower.includes('practice assignment') ||
+        titleLower.includes('ungraded quiz') ||
+        titleLower.includes('practice test')
+      ) {
+        if (!titleLower.includes('graded')) return true;
+      }
+
+      // Check item header badges, breadcrumbs, headings
+      const badgeSelectors = [
+        '.rc-ItemTypeLabel',
+        '[data-testid*="item-type"]',
+        '[data-testid*="type-label"]',
+        '[class*="itemType"]',
+        '[class*="ItemMetadata"]',
+        '[class*="ItemHeader"]',
+        'nav[aria-label="Breadcrumb"]',
+        'nav[aria-label*="breadcrumb" i]',
+        'h1', 'h2'
+      ];
+      for (const sel of badgeSelectors) {
+        const matches = document.querySelectorAll(sel);
+        for (const el of matches) {
+          const t = (el.textContent || '').trim().toLowerCase();
+          if (
+            (t.includes('practice quiz') ||
+             t.includes('practice assignment') ||
+             t.includes('ungraded quiz') ||
+             t.includes('practice test') ||
+             t === 'practice quiz' ||
+             t === 'practice') &&
+            !t.includes('graded')
+          ) {
+            return true;
+          }
+        }
+      }
+
+      return false;
     }
   };
 
@@ -1044,149 +1094,344 @@
                (window.getComputedStyle && window.getComputedStyle(el).display !== 'none');
       };
 
+      const isNonNav = (el) => {
+        if (!el) return false;
+        return !el.closest('header, nav, [role="navigation"], [role="search"], #rendered-header, .rc-CourseNavigation');
+      };
+
       const submitSelectors = [
         'button[data-testid="submit-button"]',
         'button[data-testid="quiz-submit-button"]',
         'button[data-testid="assignment-submit-button"]',
         'button[data-testid="submit-answers-button"]',
-        'button.rc-FormRow__submit',
+        'button[data-testid="item-submit-button"]',
         'button[data-e2e="submit-button"]',
-        'button[type="submit"]',
-        'button.rc-QuizSubmitButton'
+        'button.rc-QuizSubmitButton',
+        'button.rc-FormRow__submit',
+        'button[data-testid*="submit" i]'
       ];
 
       for (const sel of submitSelectors) {
-        const btn = document.querySelector(sel);
-        if (btn && isVisible(btn)) {
+        const matches = document.querySelectorAll(sel);
+        for (const btn of matches) {
+          if (isVisible(btn) && isNonNav(btn)) {
+            const t = (btn.textContent || '').trim().toLowerCase();
+            if (!t.includes('cancel') && !t.includes('search') && !t.includes('feedback')) {
+              activeQuizState.submissionButton = btn;
+              return btn;
+            }
+          }
+        }
+      }
+
+      // Comprehensive search across all buttons outside navigation
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isNonNav);
+      for (const btn of buttons) {
+        if (!isVisible(btn)) continue;
+        const t = (btn.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+        const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+
+        // Reject non-submit actions
+        if (t.includes('cancel') || t.includes('search') || t.includes('feedback') || t.includes('discussion') || t.includes('help') || t.includes('report') || t.includes('save draft')) {
+          continue;
+        }
+
+        if (
+          testId.includes('submit') ||
+          t === 'submit' ||
+          t.includes('submit quiz') ||
+          t.includes('submit assignment') ||
+          t.includes('submit answers') ||
+          t.includes('submit attempt') ||
+          t.includes('submit for grading') ||
+          t.includes('submit work') ||
+          t.startsWith('submit ') ||
+          t.endsWith(' submit') ||
+          aria.includes('submit quiz') ||
+          aria.includes('submit assignment') ||
+          aria === 'submit'
+        ) {
           activeQuizState.submissionButton = btn;
           return btn;
         }
       }
 
-      // Text search fallback
-      const buttons = document.querySelectorAll('button');
-      for (const btn of buttons) {
-        const t = (btn.textContent || '').trim().toLowerCase();
-        if ((t.includes('submit quiz') || t.includes('submit assignment') || t === 'submit' || t.includes('submit answers') || t.includes('submit for grading')) && isVisible(btn)) {
-          activeQuizState.submissionButton = btn;
-          return btn;
+      // Fallback: Check for form submission button inside quiz container
+      const quizContainer = document.querySelector('form.rc-QuizForm, div[data-testid="part-Submission_Part"], form');
+      if (quizContainer && isNonNav(quizContainer)) {
+        const formSubmitBtn = quizContainer.querySelector('button[type="submit"]');
+        if (formSubmitBtn && isVisible(formSubmitBtn)) {
+          activeQuizState.submissionButton = formSubmitBtn;
+          return formSubmitBtn;
         }
       }
 
       return null;
     },
 
-    findAndTickHonorCode() {
+    findAndTickHonorCode(scope) {
       console.log('[CourseraSolver] Searching for Coursera Honor Code checkbox...');
+
+      const isHonorCodeText = (text) => {
+        if (!text) return false;
+        const t = text.toLowerCase().replace(/[\u2018\u2019']/g, "'");
+        return t.includes('honor') ||
+               t.includes('understand that submitting') ||
+               t.includes("isn't my own") ||
+               t.includes('is not my own') ||
+               t.includes('permanent failure') ||
+               t.includes('deactivation') ||
+               t.includes('academic integrity') ||
+               t.includes('own work') ||
+               t.includes('pledge') ||
+               t.includes('certify') ||
+               t.includes('code of conduct') ||
+               t.includes('completed this work independently') ||
+               (t.includes('understand') && t.includes('submitting')) ||
+               (t.includes('agree') && t.includes('code')) ||
+               (t.includes('agree') && t.includes('terms'));
+      };
+
+      const fillHonorCodeSignature = (box) => {
+        try {
+          const container = box.closest('form, div[role="dialog"], div[data-testid="part-Submission_Part"], main') || document.body;
+          const nameInput = container.querySelector(
+            'input[type="text"][data-testid*="signature"], input[type="text"][data-testid*="name"], input[type="text"][placeholder*="name" i], input[type="text"][placeholder*="signature" i], input[type="text"][aria-label*="name" i], input[type="text"][name*="signature" i]'
+          );
+          if (nameInput && !nameInput.value) {
+            const text = container.innerText || '';
+            let studentName = '';
+            const match = text.match(/I,\s*([^,\n]+),\s*understand/i);
+            if (match && match[1]) {
+              studentName = match[1].trim();
+            }
+            if (!studentName) {
+              const profileBtn = document.querySelector('[data-testid="user-profile-button"], [aria-label*="profile" i]');
+              studentName = profileBtn?.innerText?.trim() || 'Student';
+            }
+            if (studentName) {
+              nameInput.focus();
+              const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+              if (nativeSetter) nativeSetter.call(nameInput, studentName);
+              else nameInput.value = studentName;
+              if (nameInput._valueTracker) {
+                try { nameInput._valueTracker.setValue(''); } catch (_) {}
+              }
+              nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+              nameInput.dispatchEvent(new Event('change', { bubbles: true }));
+              console.log(`[CourseraSolver] Filled Honor Code signature with "${studentName}"`);
+            }
+          }
+        } catch (_) {}
+      };
 
       const tickCheckbox = (box) => {
         if (!box) return false;
         const isInput = box.tagName === 'INPUT';
         if (isInput && box.checked) {
-          console.log('[CourseraSolver] Honor Code checkbox is already checked.');
+          console.log('[CourseraSolver] Honor Code checkbox is already checked. ✅');
+          fillHonorCodeSignature(box);
           return true;
         }
         if (box.getAttribute('aria-checked') === 'true') {
-          console.log('[CourseraSolver] Honor Code checkbox is already aria-checked.');
+          console.log('[CourseraSolver] Honor Code checkbox is already aria-checked. ✅');
+          fillHonorCodeSignature(box);
           return true;
         }
 
-        const parent = box.closest('label') || box.parentElement;
+        const label = box.closest('label') || (box.id ? document.querySelector(`label[for="${box.id}"]`) : null);
+        const ind = (label || box.parentElement)?.querySelector(
+          '.cds-checkbox-indicator, .cds-checkboxAndRadio-indicator, [class*="indicator"]'
+        );
+
+        try { (box.parentElement || box).scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch(e) {}
+
         const evtOpts = { bubbles: true, cancelable: true, composed: true, view: window };
 
-        try { (parent || box).scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch(e) {}
-
-        // Click parent label / container first (natural human action)
-        const clickTarget = parent || box;
-        clickTarget.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
-        clickTarget.dispatchEvent(new MouseEvent('mousedown', evtOpts));
-        clickTarget.dispatchEvent(new PointerEvent('pointerup', evtOpts));
-        clickTarget.dispatchEvent(new MouseEvent('mouseup', evtOpts));
-        try { clickTarget.click(); } catch(e) {}
-
         if (isInput) {
-          if (!box.checked) {
-            box.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
-            box.dispatchEvent(new MouseEvent('mousedown', evtOpts));
-            box.dispatchEvent(new PointerEvent('pointerup', evtOpts));
-            box.dispatchEvent(new MouseEvent('mouseup', evtOpts));
-            try { box.click(); } catch(e) {}
+          // Native DOM click on the checkbox
+          try { box.click(); } catch(e) {}
+
+          // If still not checked, try clicking the label or indicator
+          if (!box.checked && label) {
+            try { label.click(); } catch(e) {}
           }
+          if (!box.checked && ind) {
+            try { ind.click(); } catch(e) {}
+          }
+
+          // If still not checked, force via prototype setter & React valueTracker
           if (!box.checked) {
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked')?.set;
             if (nativeSetter) nativeSetter.call(box, true);
             else box.checked = true;
+
+            if (box._valueTracker) {
+              try { box._valueTracker.setValue(false); } catch (_) {}
+            }
+            box.dispatchEvent(new Event('input', evtOpts));
+            box.dispatchEvent(new Event('change', evtOpts));
           }
-          if (box._valueTracker) {
-            box._valueTracker.setValue(false);
+
+          // Notify React listeners via synthetic props with checked: true
+          const targetElements = [box, label, ind, box.parentElement].filter(Boolean);
+          for (const el of targetElements) {
+            const rKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            if (rKey && el[rKey]) {
+              const p = el[rKey];
+              if (typeof p.onChange === 'function') {
+                try {
+                  p.onChange({
+                    target: box,
+                    currentTarget: el,
+                    type: 'change',
+                    bubbles: true,
+                    defaultPrevented: false
+                  });
+                } catch(e) {}
+              }
+            }
           }
-          box.dispatchEvent(new Event('input', evtOpts));
-          box.dispatchEvent(new Event('change', evtOpts));
+        } else {
+          // Non-input element (e.g. role="checkbox", div, button)
+          try { box.click(); } catch(e) {}
+          if (label && label !== box) {
+            try { label.click(); } catch(e) {}
+          }
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
+            try { box.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
+          });
+
+          const targetElements = [box, label, box.parentElement].filter(Boolean);
+          for (const el of targetElements) {
+            const rKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            if (rKey && el[rKey]) {
+              const p = el[rKey];
+              if (typeof p.onClick === 'function') {
+                try { p.onClick({ target: box, currentTarget: el, type: 'click', bubbles: true }); } catch(e) {}
+              }
+              if (typeof p.onChange === 'function') {
+                try { p.onChange({ target: box, currentTarget: el, type: 'change', bubbles: true }); } catch(e) {}
+              }
+            }
+          }
         }
 
         box.setAttribute('aria-checked', 'true');
-        if (parent) {
-          parent.setAttribute('data-selected', 'true');
-          parent.setAttribute('aria-checked', 'true');
-          const ind = parent.querySelector('.cds-checkbox-indicator, .cds-checkboxAndRadio-indicator, [class*="indicator"]');
-          if (ind) ind.classList.add('checked', 'selected');
+        if (label) {
+          label.setAttribute('data-selected', 'true');
+          label.setAttribute('aria-checked', 'true');
+        }
+        if (ind) {
+          ind.classList.add('checked', 'selected', 'cds-checkbox-checked');
         }
 
+        fillHonorCodeSignature(box);
         console.log('[CourseraSolver] Coursera Honor Code checkbox successfully ticked! ✅');
         return true;
       };
 
-      // Strategy 1: Specific selectors (ID, name, data-testid, aria-label)
-      const specificSelectors = [
-        'input[type="checkbox"][data-testid*="honor"]',
-        'input[type="checkbox"][data-testid*="agreement"]',
-        'input[type="checkbox"][data-testid*="honor-code"]',
-        'input[type="checkbox"][id*="honor"]',
-        'input[type="checkbox"][id*="agreement"]',
-        'input[type="checkbox"][name*="honor"]',
-        'input[type="checkbox"][name*="agreement"]',
-        'input[type="checkbox"][aria-label*="honor" i]',
-        'input[type="checkbox"][aria-label*="understand" i]',
-        '[role="checkbox"][data-testid*="honor"]',
-        '[role="checkbox"][data-testid*="agreement"]',
-        'div[data-testid*="honor"] input[type="checkbox"]',
-        'div[data-testid*="agreement"] input[type="checkbox"]'
-      ];
-      for (const sel of specificSelectors) {
-        const match = document.querySelector(sel);
-        if (match && tickCheckbox(match)) return true;
+      // Check inside a specific container/scope
+      const checkInContainer = (container) => {
+        if (!container) return false;
+
+        // Specific Honor Code selectors (explicitly targeted, never inside questions)
+        const specificSelectors = [
+          'input[type="checkbox"][data-testid*="honor"]',
+          'input[type="checkbox"][data-testid*="agreement"]',
+          'input[type="checkbox"][data-testid*="honor-code"]',
+          'input[type="checkbox"][data-testid*="pledge"]',
+          'input[type="checkbox"][id*="honor"]',
+          'input[type="checkbox"][id*="agreement"]',
+          'input[type="checkbox"][name*="honor"]',
+          'input[type="checkbox"][name*="agreement"]',
+          'input[type="checkbox"][aria-label*="honor" i]',
+          'input[type="checkbox"][aria-label*="understand" i]',
+          'input[type="checkbox"][aria-label*="agreement" i]',
+          '[role="checkbox"][data-testid*="honor"]',
+          '[role="checkbox"][data-testid*="agreement"]',
+          '[role="checkbox"][aria-label*="honor" i]',
+          '[role="checkbox"][aria-label*="understand" i]',
+          'div[data-testid*="honor"] input[type="checkbox"]',
+          'div[data-testid*="agreement"] input[type="checkbox"]',
+          'label[data-testid*="honor"] input[type="checkbox"]',
+          'label[class*="honor" i] input[type="checkbox"]'
+        ];
+        for (const sel of specificSelectors) {
+          const matches = container.querySelectorAll(sel);
+          for (const match of matches) {
+            if (tickCheckbox(match)) return true;
+          }
+        }
+
+        // Text inspection across all checkboxes in this container
+        const allBoxes = Array.from(container.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
+        for (const box of allBoxes) {
+          const label = box.closest('label') || (box.id ? document.querySelector(`label[for="${box.id}"]`) : null);
+          const parent = box.closest('div[class*="agreement"], div[class*="honor"], div[class*="Honor"], div[data-testid*="agreement"], div[data-testid*="honor"]') || box.parentElement;
+          const text = ((label ? (label.innerText || label.textContent) : '') + ' ' +
+                        (parent ? (parent.innerText || parent.textContent) : '')).trim();
+
+          if (isHonorCodeText(text)) {
+            if (tickCheckbox(box)) return true;
+          }
+        }
+
+        // Check near submit button within this container
+        const submitBtn = this.findSubmitButton();
+        if (submitBtn && container.contains(submitBtn)) {
+          const submitArea = submitBtn.closest('form, div[data-testid="part-Submission_Part"], main') || container;
+          const candidateBoxes = Array.from(submitArea.querySelectorAll('input[type="checkbox"], [role="checkbox"]'))
+            .filter(box => !box.closest('[data-testid^="question-"], .rc-FormRow, [role="radiogroup"]'));
+
+          for (const box of candidateBoxes) {
+            const label = box.closest('label') || (box.id ? document.querySelector(`label[for="${box.id}"]`) : null);
+            const text = ((label ? (label.innerText || label.textContent) : '') + ' ' +
+                          (box.parentElement ? (box.parentElement.innerText || box.parentElement.textContent) : '')).trim();
+            if (isHonorCodeText(text)) {
+              if (tickCheckbox(box)) return true;
+            }
+          }
+
+          if (candidateBoxes.length === 1) {
+            console.log('[CourseraSolver] Single candidate checkbox found near submission, ticking as honor code...');
+            if (tickCheckbox(candidateBoxes[0])) return true;
+          } else if (candidateBoxes.length > 1) {
+            const lastBox = candidateBoxes[candidateBoxes.length - 1];
+            console.log('[CourseraSolver] Ticking non-question checkbox right before submit button...');
+            if (tickCheckbox(lastBox)) return true;
+          }
+        }
+
+        return false;
+      };
+
+      // 1. If explicit scope provided (e.g. modal dialog), search inside it first
+      if (scope) {
+        if (checkInContainer(scope)) return true;
       }
 
-      // Strategy 2: Text inspection across all checkboxes on the page
-      const allCheckboxes = document.querySelectorAll('input[type="checkbox"], [role="checkbox"]');
-      const honorKeywords = [
-        'honor', 'understand', 'submitting', 'own work', 'conduct',
-        'integrity', 'pledge', 'agreement', 'failure of this course', 'deactivation'
-      ];
-
-      for (const box of allCheckboxes) {
-        let current = box.parentElement;
-        let combinedText = '';
-        for (let depth = 0; depth < 5 && current; depth++) {
-          combinedText += ' ' + (current.innerText || current.textContent || '');
-          if (current.tagName === 'FORM' || current.getAttribute('data-testid') === 'part-Submission_Part') break;
-          current = current.parentElement;
-        }
-        combinedText = combinedText.toLowerCase();
-
-        if (honorKeywords.some(kw => combinedText.includes(kw))) {
-          if (tickCheckbox(box)) return true;
-        }
+      // 2. Check any open confirmation modal dialogs
+      const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[aria-modal="true"], .rc-Modal, [data-testid*="modal"]'));
+      for (const dialog of dialogs) {
+        if (checkInContainer(dialog)) return true;
       }
 
-      // Strategy 3: Checkbox situated near the submit button
-      const submitBtn = this.findSubmitButton();
-      if (submitBtn) {
-        const submitContainer = submitBtn.closest('form, div[class*="submit"], div[class*="Submit"], div[class*="footer"], div.rc-FormRow') || submitBtn.parentElement;
-        if (submitContainer) {
-          const nearCheckbox = submitContainer.querySelector('input[type="checkbox"], [role="checkbox"]');
-          if (nearCheckbox && tickCheckbox(nearCheckbox)) return true;
-        }
+      // 3. Scroll to the bottom to ensure submission footer is in DOM
+      try {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' });
+      } catch(e) {}
+
+      // 4. Check entire document
+      if (checkInContainer(document.body || document)) return true;
+
+      // 5. Fallback: single non-question checkbox on the entire page
+      const nonQuestionBoxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'))
+        .filter(box => !box.closest('[data-testid^="question-"], .rc-FormRow, .rc-Question, .rc-QuizQuestion, [role="radiogroup"]'));
+      if (nonQuestionBoxes.length === 1) {
+        console.log('[CourseraSolver] Ticking only non-question checkbox on page as honor code...');
+        if (tickCheckbox(nonQuestionBoxes[0])) return true;
       }
 
       return false;
@@ -1217,14 +1462,25 @@
     },
 
     async submit() {
-      // 1. Tick agreement checkbox
-      this.checkAgreementIfPresent();
+      console.log('[CourseraSolver] Initiating quiz submission sequence...');
 
-      // 2. Find submit button
+      // 1. Scroll to the bottom so bottom elements and sticky footers are in DOM
+      try {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+      } catch(e) {}
+      await new Promise(r => setTimeout(r, 400));
+
+      // 2. Tick Honor Code agreement checkbox
+      this.findAndTickHonorCode();
+      await new Promise(r => setTimeout(r, 300));
+
+      // 3. Find submit button
       let btn = this.findSubmitButton();
       if (!btn) {
-        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-        await new Promise(r => setTimeout(r, 600));
+        try {
+          window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        } catch(e) {}
+        await new Promise(r => setTimeout(r, 800));
         btn = this.findSubmitButton();
       }
 
@@ -1234,16 +1490,15 @@
 
       try { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch(e) {}
 
-      // 3. Wait for Coursera React state to enable button (up to 3.5s)
-      this.checkAgreementIfPresent();
-      for (let i = 0; i < 12; i++) {
+      // 4. Wait for Coursera React state to enable button (up to 3.5s)
+      for (let i = 0; i < 14; i++) {
         if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') break;
-        await new Promise(r => setTimeout(r, 300));
-        this.checkAgreementIfPresent();
+        await new Promise(r => setTimeout(r, 250));
+        this.findAndTickHonorCode();
         btn = this.findSubmitButton() || btn;
       }
 
-      // 4. Force enable if still marked disabled
+      // 5. Force enable if still marked disabled in DOM
       if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
         btn.disabled = false;
         btn.removeAttribute('disabled');
@@ -1252,48 +1507,106 @@
 
       console.log('[CourseraSolver] Submitting quiz via Coursera button click...');
       const evtOpts = { bubbles: true, cancelable: true, composed: true, view: window };
-      btn.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
-      btn.dispatchEvent(new MouseEvent('mousedown', evtOpts));
-      btn.dispatchEvent(new PointerEvent('pointerup', evtOpts));
-      btn.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
+        try { btn.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
+      });
       try { btn.click(); } catch(e) {}
 
-      // 5. Check and click confirmation modal popup
-      for (let attempt = 0; attempt < 8; attempt++) {
+      // Invoke React's internal onClick directly
+      const rKey = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+      if (rKey && btn[rKey] && typeof btn[rKey].onClick === 'function') {
+        console.log('[CourseraSolver] Direct React onClick invocation on submit button...');
+        try {
+          btn[rKey].onClick({
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            nativeEvent: new MouseEvent('click', evtOpts),
+            target: btn,
+            currentTarget: btn
+          });
+        } catch(err) {
+          console.warn('[CourseraSolver] React onClick invocation error:', err);
+        }
+      }
+
+      // Also trigger parent form requestSubmit if present
+      const parentForm = btn.closest('form');
+      if (parentForm) {
+        try {
+          if (typeof parentForm.requestSubmit === 'function') {
+            parentForm.requestSubmit(btn);
+          } else {
+            parentForm.dispatchEvent(new Event('submit', evtOpts));
+          }
+        } catch(e) {}
+      }
+
+      // 6. Handle Confirmation Modal Dialog (Wait and click confirm/submit, excluding cancel/close)
+      for (let attempt = 0; attempt < 10; attempt++) {
         await new Promise(r => setTimeout(r, 500));
-        const confirmSelectors = [
-          'button[data-testid="confirm-submit"]',
-          'button[data-testid="modal-submit-button"]',
-          'button.rc-Modal__submit',
-          'button[data-e2e="confirm-submit-button"]',
-          'div[role="dialog"] button[type="submit"]',
-          'div[role="dialog"] button.cds-button',
-          'div[aria-modal="true"] button'
-        ];
-        let foundModal = false;
-        for (const cSel of confirmSelectors) {
-          const cBtn = document.querySelector(cSel);
-          if (cBtn && !cBtn.disabled) {
-            const dt = (cBtn.textContent || '').trim().toLowerCase();
-            if (!dt.includes('cancel') && !dt.includes('back') && !dt.includes('close')) {
-              cBtn.click();
-              foundModal = true;
-              break;
+        const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[aria-modal="true"], .rc-Modal, [data-testid*="modal"]'));
+        if (!dialogs.length) continue;
+
+        let modalHandled = false;
+        for (const dialog of dialogs) {
+          // Ensure Honor Code inside confirmation modal is ticked first!
+          try {
+            this.findAndTickHonorCode(dialog);
+            await new Promise(r => setTimeout(r, 200));
+          } catch(e) {}
+
+          const buttons = Array.from(dialog.querySelectorAll('button, [role="button"]'));
+
+          // Find confirm button, strictly filtering out cancel/close buttons
+          const confirmBtn = buttons.find(b => {
+            const t = (b.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+            const testId = (b.getAttribute('data-testid') || '').toLowerCase();
+
+            // Must NOT be cancel/back/close/dismiss
+            if (t.includes('cancel') || t.includes('back') || t.includes('close') || t.includes('dismiss') || t.includes('no') ||
+                aria.includes('close') || aria.includes('cancel') || testId.includes('cancel') || testId.includes('close')) {
+              return false;
             }
+
+            // Must match submit/confirm keywords or primary styling
+            return t.includes('submit') || t.includes('confirm') || t.includes('yes') || t.includes('continue') ||
+                   t.includes('grade') || t.includes('agree') || aria.includes('submit') || aria.includes('confirm') ||
+                   testId.includes('submit') || testId.includes('confirm') ||
+                   b.classList.contains('cds-button-primary') || b.classList.contains('primary');
+          });
+
+          if (confirmBtn) {
+            if (confirmBtn.disabled || confirmBtn.getAttribute('aria-disabled') === 'true') {
+              try { this.findAndTickHonorCode(dialog); } catch(e) {}
+              confirmBtn.disabled = false;
+              confirmBtn.removeAttribute('disabled');
+              confirmBtn.removeAttribute('aria-disabled');
+            }
+
+            console.log('[CourseraSolver] Confirmation modal detected! Clicking confirm button:', confirmBtn.textContent.trim());
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evt => {
+              try { confirmBtn.dispatchEvent(new MouseEvent(evt, evtOpts)); } catch(e) {}
+            });
+            try { confirmBtn.click(); } catch(e) {}
+
+            const cKey = Object.keys(confirmBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            if (cKey && confirmBtn[cKey] && typeof confirmBtn[cKey].onClick === 'function') {
+              try {
+                confirmBtn[cKey].onClick({
+                  preventDefault: () => {},
+                  stopPropagation: () => {},
+                  nativeEvent: new MouseEvent('click', evtOpts),
+                  target: confirmBtn,
+                  currentTarget: confirmBtn
+                });
+              } catch(e) {}
+            }
+            modalHandled = true;
+            break;
           }
         }
-        if (!foundModal) {
-          const dialogButtons = document.querySelectorAll('div[role="dialog"] button, .rc-Modal button, div[aria-modal="true"] button');
-          for (const dB of dialogButtons) {
-            const dt = (dB.textContent || '').trim().toLowerCase();
-            if (!dt.includes('cancel') && !dt.includes('back') && !dt.includes('close') && (dt.includes('submit') || dt.includes('confirm') || dt === 'yes' || dt.includes('yes, submit'))) {
-              dB.click();
-              foundModal = true;
-              break;
-            }
-          }
-        }
-        if (foundModal) break;
+        if (modalHandled) break;
       }
 
       // Quiz has been submitted! Immediately mark and lock submission state:
@@ -1317,6 +1630,11 @@
       if (typeof GradesAutopilotEngine !== 'undefined' && GradesAutopilotEngine) {
         GradesAutopilotEngine.onQuizCompletedAndSubmitted();
       }
+
+      // Hook: Notify ModuleQuizBatch (batch-solver.js) that this quiz was submitted
+      try {
+        window.postMessage({ source: 'CQS_CONTENT', command: 'QUIZ_SUBMITTED', type: 'QUIZ_SUBMITTED' }, '*');
+      } catch(e) {}
 
       return { success: true, status: 'submission_dispatched' };
     }
@@ -3617,6 +3935,21 @@
       return;
     }
     const src = event.data.source;
+
+    // ── Handle ModuleQuizBatch trigger (from batch-solver.js) ───────────────
+    if (src === 'MQB_BATCH') {
+      if (event.data.command === 'AUTO_SOLVE_NOW') {
+        try {
+          if (typeof AutoSolverEngine !== 'undefined' && AutoSolverEngine) {
+            AutoSolverEngine.hasJustSubmitted = false;
+            AutoSolverEngine.lastSubmittedAt  = 0;
+            AutoSolverEngine.checkAndAutoSolve().catch(() => {});
+          }
+        } catch(e) {}
+      }
+      return;
+    }
+
     if (src !== 'QUIZ_SOLVER_BRIDGE' && src !== 'CQS_PAGE_BRIDGE') {
       return;
     }
@@ -4774,19 +5107,35 @@
       const startSelectors = [
         'button[data-testid="start-quiz-button"]',
         'button[data-testid="take-quiz-button"]',
+        'button[data-testid="resume-quiz-button"]',
+        'button[data-testid="start-assignment-button"]',
         'button[data-testid="action-button"]',
         'button[data-testid="start-attempt-button"]',
+        'button[data-testid="resume-attempt-button"]',
         'button[data-testid*="start"]',
+        'button[data-testid*="assignment"]',
         'button[data-testid*="attempt"]',
+        'button[data-testid*="resume"]',
+        'button[data-testid*="retake"]',
+        'button[data-testid*="try-again"]',
         'button[data-testid*="take-quiz"]',
         'button[data-e2e="start-quiz-button"]',
         'button[data-e2e="take-quiz-button"]',
+        'button[data-e2e="resume-quiz-button"]',
         'button[data-e2e*="start"]',
+        'button[data-e2e*="assignment"]',
+        'button[data-e2e*="resume"]',
         'button.rc-StartQuizButton',
         'a[data-testid="start-quiz-button"]',
+        'a[data-testid="start-assignment-button"]',
+        'a[data-testid="resume-quiz-button"]',
         'a[data-testid="take-quiz-button"]',
         'a[data-testid*="start"]',
+        'a[data-testid*="assignment"]',
+        'a[data-testid*="resume"]',
         'a[role="button"][data-testid*="start"]',
+        'a[role="button"][data-testid*="assignment"]',
+        'a[role="button"][data-testid*="resume"]',
         'a[role="button"][data-testid*="attempt"]',
         '.rc-ItemOverview button',
         '.rc-ItemOverview a[role="button"]',
@@ -4799,40 +5148,36 @@
           const matched = document.querySelectorAll(sel);
           for (const btn of matched) {
             if (isElementVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-              // Ensure it's not a submit button, not resume, not retake, and not try again
+              // Ensure it's not a final submit button
               const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-              if (testId.includes('submit') || testId.includes('resume') || testId.includes('retake') || testId.includes('try-again')) continue;
+              if (testId === 'submit-button' || testId === 'quiz-submit-button') continue;
               const btnId = (btn.id || '').toLowerCase();
-              if (btnId.includes('resume') || btnId.includes('retake') || btnId.includes('try-again')) continue;
-              const btnClass = (btn.className || '').toString().toLowerCase();
-              if (btnClass.includes('resume') || btnClass.includes('retake') || btnClass.includes('try-again')) continue;
+              if (btnId === 'submit-button' || btnId === 'quiz-submit-button') continue;
               const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-              if (ariaLabel.includes('resume') || ariaLabel.includes('retake') || ariaLabel.includes('try again')) continue;
+              if (ariaLabel === 'submit' || ariaLabel === 'submit quiz' || ariaLabel === 'submit assignment') continue;
               const btnText = (btn.textContent || '').trim().toLowerCase();
-              if (btnText.includes('resume') || btnText.includes('retake') || btnText.includes('try again') || btnText.includes('take again')) continue;
+              if (btnText === 'submit' || btnText === 'submit quiz' || btnText === 'submit assignment') continue;
               return btn;
             }
           }
         } catch(e) {}
       }
 
-      // 2. Comprehensive text & aria-label search across all interactive elements (RESUME & RETAKE EXCLUDED)
-      const clickables = document.querySelectorAll('button, a[role="button"], a.cds-button, div[role="button"]');
+      // 2. Comprehensive text & aria-label search across all interactive elements
+      const clickables = document.querySelectorAll('button, a, div[role="button"], span[role="button"]');
       for (const btn of clickables) {
         if (!isElementVisible(btn) || btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
 
-        // Ensure not a submission button, not resume, not retake, not try again
+        // Ensure not a final submit button
         const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-        if (testId.includes('submit') || testId.includes('resume') || testId.includes('retake') || testId.includes('try-again')) continue;
+        if (testId === 'submit-button' || testId === 'quiz-submit-button') continue;
         const btnId = (btn.id || '').toLowerCase();
-        if (btnId.includes('resume') || btnId.includes('retake') || btnId.includes('try-again')) continue;
-        const btnClass = (btn.className || '').toString().toLowerCase();
-        if (btnClass.includes('resume') || btnClass.includes('retake') || btnClass.includes('try-again')) continue;
+        if (btnId === 'submit-button' || btnId === 'quiz-submit-button') continue;
         const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-        if (ariaLabel.includes('resume') || ariaLabel.includes('retake') || ariaLabel.includes('try again')) continue;
+        if (ariaLabel === 'submit' || ariaLabel === 'submit quiz' || ariaLabel === 'submit assignment') continue;
 
         const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-        if (text.includes('resume') || text.includes('retake') || text.includes('try again') || text.includes('take again')) continue;
+        if (text === 'submit' || text === 'submit quiz' || text === 'submit assignment') continue;
 
         const combined = (text + ' ' + ariaLabel).trim();
 
@@ -4846,32 +5191,33 @@
 
     isStartButtonText(t) {
       if (!t) return false;
-      // Filter out non-start actions and RESUME/RETAKE/TRY AGAIN buttons completely
+      // Filter out non-start actions (be careful not to match 'submission' with 'submit')
       if (t.includes('cancel') || t.includes('back') || t.includes('close') || t.includes('download') ||
           t.includes('discussion') || t.includes('previous') || t.includes('next item') || t.includes('mark as completed') ||
-          t.includes('view feedback') || t.includes('resume') || t.includes('retake') || t.includes('try again') ||
-          t.includes('take again') || t.includes('view score') || t.includes('review') || t.includes('grade')) {
+          t.includes('view feedback') || t.includes('view score') || t.includes('review') ||
+          t === 'submit' || t === 'submit quiz' || t === 'submit assignment' || t === 'submit answers' || t === 'submit for grading') {
         return false;
       }
 
-      // Exact matches (Initial starts only, no retakes or try-agains)
-      if (t === 'start' || t === 'begin' || t === 'take quiz' || t === 'start quiz') {
+      // Exact matches
+      if (t === 'start' || t === 'begin' || t === 'take quiz' || t === 'start quiz' || t === 'start assignment' || t === 'resume' || t === 'resume quiz' || t === 'continue' || t === 'retake' || t === 'try again') {
         return true;
       }
 
-      // Keyword matches (Initial starts only)
+      // Keyword matches
       const keywords = [
-        'start quiz', 'take quiz', 'start assignment',
-        'start attempt', 'begin quiz',
+        'start quiz', 'take quiz', 'start assignment', 'resume quiz', 'continue quiz',
+        'resume assignment', 'start attempt', 'resume attempt', 'begin quiz',
         'begin attempt', 'take practice quiz', 'start practice', 'go to quiz', 'open quiz',
-        'attempt quiz'
+        'attempt quiz', 'try again', 'retake quiz', 'retake assignment', 'take again',
+        'start test', 'take test', 'resume test'
       ];
       if (keywords.some(kw => t.includes(kw))) {
         return true;
       }
 
-      // Starts with start / take / begin (NOT retake)
-      if (/^(start|take|begin)\b/i.test(t)) {
+      // Starts with start / take / begin / resume / continue / retake
+      if (/^(start|take|begin|resume|continue|retake)\b/i.test(t)) {
         return true;
       }
 
@@ -4924,10 +5270,10 @@
           for (const mBtn of modalBtns) {
             if (!isElementVisible(mBtn) || mBtn.disabled) continue;
             const mText = (mBtn.innerText || mBtn.textContent || '').trim().toLowerCase();
-            if (mText.includes('cancel') || mText.includes('back') || mText.includes('close') || mText.includes('dismiss') || mText.includes('resume') || mText.includes('retake') || mText.includes('try again')) {
+            if (mText.includes('cancel') || mText.includes('back') || mText.includes('close') || mText.includes('dismiss')) {
               continue;
             }
-            if (mText.includes('start') || mText.includes('continue') || mText.includes('confirm') || mText.includes('attempt') || mText.includes('agree') || mText === 'yes') {
+            if (mText.includes('start') || mText.includes('continue') || mText.includes('confirm') || mText.includes('attempt') || mText.includes('agree') || mText.includes('resume') || mText.includes('retake') || mText === 'yes' || mText.includes('yes, start')) {
               console.log(`[CourseraSolver] Modal confirm button found: "${mText}". Clicking to start attempt!`);
               clickElement(mBtn);
               return true;
@@ -5143,6 +5489,20 @@
       return true;
     }
 
+    // 1b. Fetch course materials for batch solver
+    if (action === 'FETCH_COURSE_MATERIALS') {
+      const slug = request.courseSlug || getCourseContext()?.courseSlug;
+      if (!slug) { sendResponse({ materials: null, error: 'No course slug' }); return true; }
+      const includes = 'modules,lessons,passableItemGroups,passableItemGroupChoices,passableLessonElements,items,tracks,gradePolicy,gradingParameters,embeddedContentMapping';
+      const fields   = 'moduleIds,onDemandCourseMaterialModules.v1(name,slug,lessonIds,optional),onDemandCourseMaterialLessons.v1(name,slug,elementIds,optional,trackId),onDemandCourseMaterialPassableLessonElements.v1(gradingWeight,isRequiredForPassing),onDemandCourseMaterialItems.v2(name,originalName,slug,timeCommitment,contentSummary,isLocked,lockableByItem,itemLockedReasonCode,trackId,lockedStatus,itemLockSummary),onDemandGradingParameters.v1(gradedAssignmentGroups)';
+      const url = `${BASE_COURSERA}/api/onDemandCourseMaterials.v2/?q=slug&slug=${encodeURIComponent(slug)}&includes=${includes}&fields=${fields}&showLockedItems=true`;
+      courseraFetch(url)
+        .then(r => r.ok ? r.json() : null)
+        .then(materials => sendResponse({ materials }))
+        .catch(err => sendResponse({ materials: null, error: err.message }));
+      return true; // async
+    }
+
     // 2. Full Quiz Extraction
     if (action === 'DETECT_QUESTIONS' || action === 'EXTRACT_QUIZ' || action === 'SOLVE_QUIZ') {
       try {
@@ -5158,6 +5518,7 @@
             success: false,
             count: 0,
             isQuizPage: isQuiz,
+            isPracticeQuiz: QuizDetector.isPracticeQuiz(),
             isReviewMode: isReview,
             hasStartButton: !!startBtn,
             reason: isReview
@@ -5189,6 +5550,7 @@
           success: true,
           count: serialized.length,
           isQuizPage: isQuiz,
+          isPracticeQuiz: QuizDetector.isPracticeQuiz(),
           isReviewMode: isReview,
           hasStartButton: !!startBtn,
           title: document.title,

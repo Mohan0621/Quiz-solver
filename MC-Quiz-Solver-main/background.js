@@ -29,7 +29,9 @@ chrome.runtime.onInstalled.addListener((details) => {
     'cqs_skip_videos',
     'cqs_skip_readings',
     'cqs_skip_discussion',
-    'cqs_skip_plugins'
+    'cqs_skip_plugins',
+    'batchSolveEnabled',
+    'batchGradedOnly'
   ], (res) => {
     const defaults = {};
 
@@ -52,6 +54,8 @@ chrome.runtime.onInstalled.addListener((details) => {
     if (typeof res.cqs_skip_plugins === 'undefined') defaults.cqs_skip_plugins = true;
     if (typeof res.autoSolveQuiz === 'undefined') defaults.autoSolveQuiz = true;
     if (typeof res.autoSubmitQuiz === 'undefined') defaults.autoSubmitQuiz = true;
+    if (typeof res.batchSolveEnabled === 'undefined') defaults.batchSolveEnabled = false;
+    if (typeof res.batchGradedOnly === 'undefined') defaults.batchGradedOnly = true;
 
     if (Object.keys(defaults).length > 0) {
       chrome.storage.local.set(defaults);
@@ -62,6 +66,26 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 // Centralized AI inference router (accessible by popup or content scripts)
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+
+  // ── Fetch Coursera course materials for batch solver ──────────────────────
+  if (request.action === 'FETCH_COURSE_MATERIALS') {
+    const slug = request.courseSlug;
+    if (!slug) { sendResponse({ materials: null, error: 'No slug' }); return; }
+
+    const includes = 'modules,lessons,passableItemGroups,passableItemGroupChoices,passableLessonElements,items,tracks,gradePolicy,gradingParameters,embeddedContentMapping';
+    const fields   = 'moduleIds,onDemandCourseMaterialModules.v1(name,slug,lessonIds,optional),onDemandCourseMaterialLessons.v1(name,slug,elementIds,optional,trackId),onDemandCourseMaterialPassableLessonElements.v1(gradingWeight,isRequiredForPassing),onDemandCourseMaterialItems.v2(name,originalName,slug,timeCommitment,contentSummary,isLocked,lockableByItem,itemLockedReasonCode,trackId,lockedStatus,itemLockSummary),onDemandGradingParameters.v1(gradedAssignmentGroups)';
+    const url = `https://www.coursera.org/api/onDemandCourseMaterials.v2/?q=slug&slug=${slug}&includes=${includes}&fields=${fields}&showLockedItems=true`;
+
+    fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } })
+      .then(r => {
+        if (!r.ok) { sendResponse({ materials: null, error: `HTTP ${r.status}` }); return; }
+        return r.json();
+      })
+      .then(data => sendResponse({ materials: data || null }))
+      .catch(err => sendResponse({ materials: null, error: err.message }));
+    return true; // async
+  }
+
   if (request.action === 'QUERY_AI') {
     handleAIQuery(request)
       .then(result => sendResponse(result))
